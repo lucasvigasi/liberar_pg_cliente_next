@@ -1,0 +1,148 @@
+#!/bin/bash
+set -euo pipefail
+
+CSF_ALLOW="/etc/csf/csf.allow"
+PG_HBA="/var/lib/pgsql/13/data/pg_hba.conf"
+
+# Cores
+BLUE='\033[1;34m'
+GREEN='\033[1;32m'
+YELLOW='\033[1;33m'
+RED='\033[1;31m'
+NC='\033[0m'
+
+# Verificação de root
+if [[ "$(id -u)" -ne 0 ]]; then
+  echo -e "${RED}ERRO: esta script precisa ser executada como root.${NC}" >&2
+  exit 1
+fi
+
+echo -e "${BLUE}==============================================${NC}"
+echo -e "${BLUE}  ASSISTENTE DE LIBERAÇÃO DE ACESSO PostgreSQL${NC}"
+echo -e "${BLUE}==============================================${NC}"
+echo
+
+# Coletar IP
+read -erp "Informe o IP a ser liberado (ex: 1.2.3.4): " IP
+
+# Validação simples de IPv4
+if ! [[ "$IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+  echo -e "${RED}IP inválido.${NC}"
+  exit 1
+fi
+
+# Coletar usuário
+read -erp "Informe o NOME do usuário PostgreSQL: " PG_USER
+if [[ -z "$PG_USER" ]]; then
+  echo -e "${RED}O nome de usuário não pode ser vazio.${NC}"
+  exit 1
+fi
+
+# Coletar senha (mostrando enquanto digita)
+read -erp "Informe a SENHA para o usuário: " PG_PASS
+
+# Resumo para revisão
+echo
+echo -e "${YELLOW}Por favor, revise as informações:${NC}"
+echo "  IP liberado........: $IP"
+echo "  Usuário PostgreSQL.: $PG_USER"
+echo "  Senha..............: $PG_PASS"
+echo
+read -erp "As informações estão corretas? (s/N): " CONFIRM
+
+if ! [[ "$CONFIRM" =~ ^[sS]$ ]]; then
+  echo "Operação cancelada pelo usuário."
+  exit 0
+fi
+
+echo
+echo -e "${GREEN}>> Ajustando CSF (${CSF_ALLOW})...${NC}"
+
+# Linha para o CSF permitindo apenas porta 5432
+CSF_LINE="tcp|in|d=5432|s=${IP} # PostgreSQL - usuario ${PG_USER}"
+
+if grep -q "tcp|in|d=5432|s=${IP}" "$CSF_ALLOW"; then
+  echo "Entrada para IP ${IP} na porta 5432 já existe em csf.allow."
+else
+  if grep -q "^# Liberação do PostgreSQL (porta 5432)" "$CSF_ALLOW"; then
+    # Insere logo abaixo do último "# ===============================" do bloco do PostgreSQL
+    sed -i "/^# ===============================$/{
+      N
+      /# Liberação do PostgreSQL (porta 5432)/{
+        N
+        /# ===============================/a ${CSF_LINE}
+      }
+    }" "$CSF_ALLOW"
+    echo "Linha adicionada dentro do bloco 'Liberação do PostgreSQL (porta 5432)'."
+  else
+    # Se o bloco não existir, cria no final do arquivo e adiciona o IP logo abaixo
+    {
+      echo
+      echo "# ==============================="
+      echo "# Liberação do PostgreSQL (porta 5432)"
+      echo "# ==============================="
+      echo "$CSF_LINE"
+    } >> "$CSF_ALLOW"
+    echo "Bloco 'Liberação do PostgreSQL (porta 5432)' criado e linha adicionada."
+  fi
+fi
+
+echo
+echo -e "${GREEN}>> Ajustando pg_hba.conf (${PG_HBA})...${NC}"
+
+# Linha para o pg_hba.conf liberando IP/32 com md5
+HBA_LINE="host    all             all             ${IP}/32          md5    # acesso ${PG_USER}"
+
+if grep -qE "[[:space:]]${IP}/32[[:space:]]+md5" "$PG_HBA"; then
+  echo "Entrada para IP ${IP}/32 com md5 já existe em pg_hba.conf."
+else
+  echo "$HBA_LINE" >> "$PG_HBA"
+  echo "Linha adicionada ao pg_hba.conf:"
+  echo "  $HBA_LINE"
+fi
+
+echo
+echo -e "${GREEN}>> Recarregando CSF...${NC}"
+csf -r
+
+echo
+echo -e "${GREEN}>> Recarregando configuração do PostgreSQL...${NC}"
+# Se existir um serviço customizado pg_reload, usa; senão, usa o padrão do PostgreSQL 13
+if systemctl list-unit-files | grep -q '^pg_reload\.service'; then
+  systemctl start pg_reload
+else
+  systemctl reload postgresql-13
+fi
+
+echo
+echo -e "${GREEN}>> Criando/ajustando usuário no PostgreSQL...${NC}"
+
+# Escapar aspas simples na senha e usuário para uso seguro no SQL
+PG_USER_ESCAPED=$(printf "%s" "$PG_USER" | sed "s/'/''/g")
+PG_PASS_ESCAPED=$(printf "%s" "$PG_PASS" | sed "s/'/''/g")
+
+# Cria o usuário se não existir e garante permissões com \gexec
+sudo -u postgres psql -v ON_ERROR_STOP=1 <<EOF
+SELECT format(
+  'CREATE ROLE %I WITH LOGIN PASSWORD %L',
+  '$PG_USER_ESCAPED',
+  '$PG_PASS_ESCAPED'
+)
+WHERE NOT EXISTS (
+  SELECT 1 FROM pg_roles WHERE rolname = '$PG_USER_ESCAPED'
+)
+\gexec
+
+SELECT format(
+  'ALTER ROLE %I WITH SUPERUSER INHERIT CREATEROLE CREATEDB LOGIN',
+  '$PG_USER_ESCAPED'
+)
+\gexec
+EOF
+
+echo
+echo -e "${GREEN}Concluído com sucesso.${NC}"
+echo "IP liberado na porta 5432 pelo CSF (dentro do bloco correto),"
+echo "entrada criada no pg_hba.conf, serviços recarregados e usuário PostgreSQL"
+echo "criado/ajustado com permissões elevadas."
+
